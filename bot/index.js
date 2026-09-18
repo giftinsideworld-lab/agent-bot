@@ -49,7 +49,13 @@ const SYSTEM_PROMPT_PATH = join(WORKSPACE, "CLAUDE.md");
 const CRASH_CONTEXT_FILE = join(DATA_DIR, ".crash_context.md");
 const STATE_FILE = join(DATA_DIR, "state.json");
 const SCHEDULES_FILE = join(DATA_DIR, "schedules.json");
-const MAX_SYSTEM_PROMPT_CHARS = 30000;
+// Раньше было 30 000 с тупым срезом в конце. При реальных размерах файлов Агента
+// до среза доходили только личность, профиль и память — а миссия, цели, проекты,
+// предпочтения, выводы и оба дневника отрезались целиком и молча.
+// 80 000 — с запасом на рост файлов. Считали по факту: при нынешних размерах
+// всё вместе даёт около 60 000, и при пределе ровно 60 000 не хватало шести
+// символов — из-за них выбрасывался вчерашний дневник целиком.
+const MAX_SYSTEM_PROMPT_CHARS = 80000;
 const STREAM_THROTTLE_MS = 1500;
 const BOT_VERSION = (() => {
   try { return readFileSync(join(import.meta.dirname, "VERSION"), "utf8").trim(); }
@@ -366,7 +372,9 @@ const ARCHITECTURE_CONTEXT = `
 `;
 
 const MAX_MEMORY_CHARS = 15000;
-const MAX_DIARY_CHARS = 2000;
+// 2 000 символов — это пара абзацев. Дневник рабочего дня в разы длиннее,
+// и в контекст попадал только самый хвост.
+const MAX_DIARY_CHARS = 6000;
 
 // Cache for system prompt file
 let _sysPromptCache = { mtime: 0, content: "" };
@@ -399,19 +407,28 @@ function buildSystemPrompt() {
   // 2. Architecture context
   parts.push(ARCHITECTURE_CONTEXT);
 
-  // 3. All DNA files (skip CLAUDE.md — already loaded)
-  const dnaFiles = [
-    "SOUL.md", "USER.md", "MEMORY.md", "MISSION.md",
-    "GOALS.md", "PROJECTS.md", "PREFERENCES.md", "LEARNED.md",
-  ];
-  for (const name of dnaFiles) {
+  // 3. Файлы Агента. У каждого свой предел, чтобы один разросшийся файл
+  //    не съедал место остальных. Обрезка всегда видимая — с пометкой.
+  const DNA_BUDGET = {
+    "SOUL.md": 13000,
+    "USER.md": 3000,
+    "MEMORY.md": 18000,
+    "MISSION.md": 2000,
+    "GOALS.md": 8000,
+    "PROJECTS.md": 6000,
+    "PREFERENCES.md": 6000,
+    "LEARNED.md": 4000,
+  };
+  for (const [name, budget] of Object.entries(DNA_BUDGET)) {
     const text = _safeRead(join(WORKSPACE, name));
-    if (text) {
-      const trimmed = name === "MEMORY.md" && text.length > MAX_MEMORY_CHARS
-        ? text.slice(0, MAX_MEMORY_CHARS) + "\n...(truncated)"
-        : text;
-      parts.push(`--- ${name} ---\n${trimmed}`);
+    if (!text) continue;
+    const trimmed = text.length > budget
+      ? text.slice(0, budget) + `\n…(файл обрезан: ${text.length} из ${budget} символов)`
+      : text;
+    if (text.length > budget) {
+      console.warn(`[контекст] ${name} обрезан: ${text.length} символов при пределе ${budget}`);
     }
+    parts.push(`--- ${name} ---\n${trimmed}`);
   }
 
   // 4. Today's diary (last N chars — newest data)
@@ -446,10 +463,21 @@ function buildSystemPrompt() {
   parts.push(`# Current date\n${today}`);
   parts.push("# Memory reminder\nЕсли в этом диалоге появились важные факты, решения или предпочтения клиента — сохрани их в memory/YYYY-MM-DD.md или MEMORY.md. Не теряй контекст между сессиями.");
 
-  // Trim to max
+  // Общий предел. Раньше здесь был срез по символу — он молча отрезал хвост,
+  // а в хвосте лежало самое свежее: цели, проекты, предпочтения и дневники.
+  // Теперь при переполнении убираем куски с конца целиком и говорим об этом в лог.
   let result = parts.join("\n\n");
   if (result.length > MAX_SYSTEM_PROMPT_CHARS) {
-    result = result.slice(0, MAX_SYSTEM_PROMPT_CHARS);
+    const dropped = [];
+    while (parts.length > 1 && parts.join("\n\n").length > MAX_SYSTEM_PROMPT_CHARS) {
+      const removed = parts.pop();
+      const title = (removed.match(/^--- (.+?) ---/) || [, "фрагмент"])[1];
+      dropped.push(title);
+    }
+    result = parts.join("\n\n");
+    console.warn(`[контекст] не поместилось, выброшено целиком: ${dropped.join(", ")}`);
+    result += `\n\n--- Внимание ---\nВ контекст не поместилось: ${dropped.join(", ")}. `
+      + `Если нужны эти данные — прочитай файлы напрямую из рабочей папки.`;
   }
   return result;
 }
@@ -1933,6 +1961,22 @@ bot.command("stop", async (ctx) => {
 });
 
 // /status — extended info
+// Экраны getMemoryText и getProjectsText были написаны, но ни к одной команде
+// не привязаны — то есть недоступны. Подключены 18 сентября 2026.
+bot.command("memory", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply(getMemoryText(), { parse_mode: "HTML" }).catch(async () => {
+    await ctx.reply(getMemoryText());
+  });
+});
+
+bot.command("projects", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply(getProjectsText(), { parse_mode: "HTML" }).catch(async () => {
+    await ctx.reply(getProjectsText());
+  });
+});
+
 bot.command("status", async (ctx) => {
   if (!isOwner(ctx)) return;
   const spent = getTodaySpend();
@@ -2726,6 +2770,8 @@ bot.start({
       { command: "reset", description: "Новая сессия" },
       { command: "settings", description: "Настройки" },
       { command: "status", description: "Статус системы" },
+      { command: "memory", description: "📚 Что в памяти" },
+      { command: "projects", description: "📁 Проекты" },
       { command: "model", description: "🧠 Выбрать модель" },
       { command: "connect", description: "🔌 VS Code через туннель" },
       { command: "reauth", description: "🔑 Переподключить Claude" },
