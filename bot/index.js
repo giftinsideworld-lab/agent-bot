@@ -513,14 +513,16 @@ class StatusMessage {
     }, 4000);
 
     this.animationInterval = setInterval(async () => {
-      if (this.stopped || this.streamingText || this.actionText || this._isBreakerActive()) return;
-      this.phraseIndex = (this.phraseIndex + 1) % THINKING_PHRASES.length;
+      if (this.stopped || this.streamingText || this._isBreakerActive()) return;
       const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+      // Если показываем действия — обновляем их же со свежим таймером.
+      // Иначе экран замирает, пока Агент думает и не трогает файлы.
+      const body = this.actionText
+        ? this.actionText + `\n\n\u23f3 ${elapsed}\u0441`
+        : (this.phraseIndex = (this.phraseIndex + 1) % THINKING_PHRASES.length,
+           formatThinkingPhrase(this.phraseIndex, elapsed));
       try {
-        await this.ctx.api.editMessageText(
-          this.chatId, this.messageId,
-          formatThinkingPhrase(this.phraseIndex, elapsed)
-        );
+        await this.ctx.api.editMessageText(this.chatId, this.messageId, body);
       } catch (e) {
         if (e?.error_code === 429) {
           this._activateBreaker(e?.parameters?.retry_after || 30);
@@ -776,6 +778,11 @@ function _callClaudeInner(prompt, sessionId, { onText, onTool } = {}) {
     const args = [
       "-p", prompt,
       "--output-format", useStream ? "stream-json" : "json",
+      // Claude Code отказывается работать с stream-json без --verbose:
+      // «When using --print, --output-format=stream-json requires --verbose».
+      // Без этого флага ответ пустой — именно поэтому потоковый режим
+      // в исходном боте никогда и не мог заработать.
+      ...(useStream ? ["--verbose"] : []),
       "--max-turns", "15",
       "--model", chosenModel,
       "--dangerously-skip-permissions",
@@ -830,7 +837,7 @@ function _callClaudeInner(prompt, sessionId, { onText, onTool } = {}) {
               }
             } else if (obj.type === "result") {
               resultSessionId = obj.session_id || sessionId;
-              cost = obj.cost_usd || 0;
+              cost = obj.total_cost_usd ?? obj.cost_usd ?? 0;
               if (obj.result) lastText = obj.result;
             }
           } catch {}
@@ -848,7 +855,7 @@ function _callClaudeInner(prompt, sessionId, { onText, onTool } = {}) {
             const obj = JSON.parse(stdout);
             if (obj.type === "result") {
               resultSessionId = obj.session_id || sessionId;
-              cost = obj.cost_usd || 0;
+              cost = obj.total_cost_usd ?? obj.cost_usd ?? 0;
               if (obj.result) lastText = obj.result;
             }
           } catch {}
@@ -873,7 +880,7 @@ function _callClaudeInner(prompt, sessionId, { onText, onTool } = {}) {
       }
       try {
         const result = JSON.parse(stdout);
-        const rcost = result.cost_usd || 0;
+        const rcost = result.total_cost_usd ?? result.cost_usd ?? 0;
         recordSpend(rcost);
         resolve({
           text: result.result || result.text || "(пустой ответ)",
@@ -1956,15 +1963,20 @@ bot.command("update", async (ctx) => {
   await ctx.reply(`Проверяю обновления... (текущая версия: ${currentVer})`);
 
   try {
-    // Источник обновлений — НАШ приватный репозиторий coo-mark, а не репозиторий
-    // автора курса. Там лежит наша версия бота со всеми доработками. Версии автора
-    // вливаются в наш репозиторий осознанно, через Claude Code, с проверкой.
-    const SRC_DIR = "/home/agent/.agent/bot-src";
-    execSync(`git -C "${SRC_DIR}" fetch -q origin main && git -C "${SRC_DIR}" reset -q --hard origin/main`, {
-      timeout: 60000,
-      env: { ...process.env, GIT_SSH_COMMAND: "ssh -i /home/agent/.ssh/coo_mark -o IdentitiesOnly=yes" },
+    // Бот живёт в собственном открытом репозитории и обновляется из себя же.
+    // Раньше обновление тянулось из репозитория автора курса и затирало доработки.
+    const BOT_REPO_RAW = "https://raw.githubusercontent.com/giftinsideworld-lab/agent-bot/main/bot";
+    const remoteVer = await new Promise((resolve, reject) => {
+      https.get(`${BOT_REPO_RAW}/VERSION`, {
+        timeout: 10000,
+        headers: { "User-Agent": "AgentBot" },
+      }, (res) => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        let data = "";
+        res.on("data", (d) => data += d);
+        res.on("end", () => resolve(data.trim()));
+      }).on("error", reject);
     });
-    const remoteVer = readFileSync(join(SRC_DIR, "bot", "VERSION"), "utf8").trim();
 
     if (remoteVer === currentVer) {
       await ctx.reply(`У тебя последняя версия (${currentVer}).`);
@@ -1977,9 +1989,9 @@ bot.command("update", async (ctx) => {
     const botDir = import.meta.dirname;
     const updateScript = join(botDir, "update-bot.sh");
 
-    // Скрипт обновления берём из нашего же источника, не из чужого репозитория
+    // Скрипт обновления берём из своего же репозитория
     if (!existsSync(updateScript)) {
-      execSync(`cp "${join(SRC_DIR, "bot", "update-bot.sh")}" "${updateScript}" && chmod +x "${updateScript}"`,
+      execSync(`curl -fsSL "${BOT_REPO_RAW}/update-bot.sh" -o "${updateScript}" && chmod +x "${updateScript}"`,
         { timeout: 15000 });
     }
 
@@ -2385,7 +2397,7 @@ bot.command("connect", async (ctx) => {
       "⚠️ VS Code CLI не установлен на сервере.\n\n" +
       "Похоже что setup-server.sh пропустил установку туннеля (нет интернета или GitHub был недоступен).\n\n" +
       "Перезапусти установку:\n" +
-      "<code>curl -sL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/setup-server.sh | bash</code>",
+      "<code>curl -fsSL https://raw.githubusercontent.com/giftinsideworld-lab/agent-bot/main/install.sh | bash -s -- ВАШ_ТОКЕН</code>",
       { parse_mode: "HTML" }
     );
     return;
